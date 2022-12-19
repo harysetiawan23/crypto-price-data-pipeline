@@ -1,0 +1,4 @@
+{
+    "MONGO": "mongodb://root:example@mongodb:27017",
+    "POSTGRES": "postgresql://warehouse:warehouse@warehouse:5432/bpi"
+}
