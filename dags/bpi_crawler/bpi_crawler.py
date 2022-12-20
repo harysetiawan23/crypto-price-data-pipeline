@@ -17,6 +17,7 @@ from pandas.api.types import is_float_dtype,is_string_dtype
 api_endpoint = "https://api.coindesk.com/v1/bpi/currentprice.json"
 
 mongodb_connection = Variable.get("MONGO")
+exchange_api_key = Variable.get("EXCHANGE_API_KEY")
 postgres_connection = Variable.get("POSTGRES")
 
 
@@ -45,15 +46,52 @@ def crawling(ti):
     res = requests.get(api_endpoint)
     payload = res.json()
 
-    print(payload)
+    if res.status_code is not 200:
+        raise ValueError('Failed to fetch data form Internet')
+    else:
+        payload = res.json()
+        print(payload)
 
-    # Load to staging-db
-    collection = mydb['payload_api']
-    db_payload = collection.insert_one(payload)
-    db_payload_id = str(db_payload.inserted_id)
+        # Load to staging-db
+        collection = mydb['payload_api']
+        db_payload = collection.insert_one(payload)
+        db_payload_id = str(db_payload.inserted_id)
 
-    print(db_payload_id,type(db_payload_id))
-    ti.xcom_push(key="bpi_crawler_payload_id",value=db_payload_id)
+        print(db_payload_id,type(db_payload_id))
+        ti.xcom_push(key="bpi_crawler_payload_id",value=db_payload_id)
+
+def gete_idr_price(ti):
+    # Load from staging-db
+    api_payload_collection = mydb['payload_api']
+    db_payload_id = ti.xcom_pull(key="bpi_crawler_payload_id")
+    db_payload = api_payload_collection.find_one({"_id":ObjectId(db_payload_id)})
+
+    amount = str(db_payload['bpi']['USD']['rate']).replace(",","")
+    print("Amount",amount)
+    key = exchange_api_key
+    print("APIKEY",exchange_api_key)
+    url = 'https://api.apilayer.com/exchangerates_data/convert'
+    params = {
+        "from":"USD",
+        "to": "IDR",
+        "amount": amount,
+        "date": datetime.strftime(datetime.now(),'%Y-%m-%d')
+    }
+    header = {
+        "apikey":key
+    }
+    res = requests.get(url=url,params=params,headers=header)
+    
+    if res.status_code is not 200:
+        raise ValueError('Failed to fetch data form Internet')
+    else:
+        payload = res.json()
+        print("IDR",payload['result'])
+        mydb['payload_api']
+        api_payload_collection = mydb['payload_api']
+        api_payload_collection.update_one({"_id":ObjectId(db_payload_id)},{"$set":{"bpi_idr_rate_float":payload['result']}})
+        
+
 
 def data_enrichment(ti):
     # Load to staging-db
@@ -75,7 +113,7 @@ def data_enrichment(ti):
     dataset['bpi_eur_code'] = db_payload['bpi']['EUR']['code']
     dataset['bpi_eur_rate_float'] = float(db_payload['bpi']['EUR']['rate'].replace(",",""))
     dataset['bpi_eur_description'] = db_payload['bpi']['EUR']['description']
-    dataset['bpi_idr_rate_float'] = dataset['bpi_usd_rate_float']*15000
+    dataset['bpi_idr_rate_float'] = float(db_payload['bpi_idr_rate_float'])
     dataset['time_updated'] = datetime.strptime(db_payload['time']['updated'],"%b %d, %Y %H:%M:%S %Z") 
     dataset['time_updated'] = datetime.strftime(dataset['time_updated'],"%Y-%m-%d %H:%M:%S")
     dataset['time_updated_iso'] = datetime.strptime(db_payload['time']['updatedISO'],"%Y-%m-%dT%H:%M:%S%z")
@@ -112,6 +150,7 @@ def test(ti):
     assert is_float_dtype(df['bpi_usd_rate_float']) == True
     assert is_float_dtype(df['bpi_gdp_rate_float']) == True
     assert is_float_dtype(df['bpi_eur_rate_float']) == True
+    assert is_float_dtype(df['bpi_idr_rate_float']) == True
 
     assert is_string_dtype(df['disclaimer']) == True
     assert is_string_dtype(df['chart_name']) == True
@@ -140,19 +179,24 @@ with DAG(dag_id="bpi_crawler_advanced", start_date=datetime(2021,1,1),
     schedule_interval="@hourly", catchup=False) as dag:
 
     crawl = PythonOperator(
-        task_id="extract",
+        task_id="retrieve_bpi_value",
         python_callable=crawling)
 
+    retrieve_idr_value = PythonOperator(
+        task_id="retrieve_idr_value",
+        python_callable=gete_idr_price
+    )
+
     enrichment = PythonOperator(
-        task_id="transform",
+        task_id="Enrichment",
         python_callable=data_enrichment)
 
     quality_checking = PythonOperator(
-        task_id="test",
+        task_id="Validation",
         python_callable=test)
     
     load_data = PythonOperator(
-        task_id="load",
+        task_id="Load",
         python_callable=load_to_postgres)
 
     clean_db = PythonOperator(
@@ -160,13 +204,13 @@ with DAG(dag_id="bpi_crawler_advanced", start_date=datetime(2021,1,1),
         python_callable=cleandb)
 
     clean_xcom = PythonOperator(
-        task_id="clean_session",
+        task_id="clean_xcom_session",
         python_callable = cleanup,
         provide_context=True, 
         # dag=dag
     )
 
 
-    crawl >> enrichment >> quality_checking >> load_data >> [clean_db,clean_xcom] 
+    crawl >> retrieve_idr_value >> enrichment >> quality_checking >> load_data >> clean_db >> clean_xcom  
 
 
