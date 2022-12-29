@@ -25,21 +25,6 @@ myclient = pymongo.MongoClient(mongodb_connection)
 mydb = myclient["warehouse"]
 
 
-
-@provide_session
-def cleanup(session=None, **context):
-    dag = context["dag"]
-    dag_id = dag._dag_id
-
-    # It will delete all xcom of the dag_id
-    session.query(XCom).filter(XCom.dag_id == dag_id).delete()
-
-def cleandb(ti):
-    # Load to staging-db
-    payload_enriched_collection = mydb['payload_enriched']
-    db_payload_id = ti.xcom_pull(key="bpi_enriched_payload_id")
-    payload_enriched_collection.delete_one({"_id":ObjectId(db_payload_id)})
-
 def crawling(ti):
     # Crawl From API
     res = requests.get(api_endpoint)
@@ -52,7 +37,7 @@ def crawling(ti):
         print(payload)
 
         # Load to staging-db
-        collection = mydb['payload_api']
+        collection = mydb['payload_api_batch']
         db_payload = collection.insert_one(payload)
         db_payload_id = str(db_payload.inserted_id)
 
@@ -61,7 +46,7 @@ def crawling(ti):
 
 def gete_idr_price(ti):
     # Load from staging-db
-    api_payload_collection = mydb['payload_api']
+    api_payload_collection = mydb['payload_api_batch']
     db_payload_id = ti.xcom_pull(key="bpi_crawler_payload_id")
     db_payload = api_payload_collection.find_one({"_id":ObjectId(db_payload_id)})
 
@@ -87,12 +72,12 @@ def gete_idr_price(ti):
         payload = res.json()
         print("IDR",payload['result'])
         mydb['payload_api']
-        api_payload_collection = mydb['payload_api']
+        api_payload_collection = mydb['payload_api_batch']
         api_payload_collection.update_one({"_id":ObjectId(db_payload_id)},{"$set":{"bpi_idr_rate_float":payload['result']}})
 
 def data_enrichment(ti):
     # Load to staging-db
-    api_payload_collection = mydb['payload_api']
+    api_payload_collection = mydb['payload_api_batch']
     db_payload_id = ti.xcom_pull(key="bpi_crawler_payload_id")
     db_payload = api_payload_collection.find_one({"_id":ObjectId(db_payload_id)})
 
@@ -118,7 +103,7 @@ def data_enrichment(ti):
     dataset['last_updated'] = datetime.strftime(datetime.now(),'%Y-%m-%d %H:%M:%S')
     
     # Load to staging-db
-    collection = mydb['payload_enriched']
+    collection = mydb['payload_enriched_batch']
     db_payload = collection.insert_one(dataset)
     db_payload_id = str(db_payload.inserted_id)
 
@@ -126,7 +111,7 @@ def data_enrichment(ti):
 
 def test(ti):
     # Load to staging-db
-    payload_enriched_collection = mydb['payload_enriched']
+    payload_enriched_collection = mydb['payload_enriched_batch']
     db_payload_id = ti.xcom_pull(key="bpi_enriched_payload_id")
     db_payload = payload_enriched_collection.find_one({"_id":ObjectId(db_payload_id)})
 
@@ -160,23 +145,40 @@ def test(ti):
 
 def load_to_postgres(ti):
     # Load to staging-db
-    payload_enriched_collection = mydb['payload_enriched']
-    db_payload_id = ti.xcom_pull(key="bpi_enriched_payload_id")
-    db_payload = payload_enriched_collection.find_one({"_id":ObjectId(db_payload_id)})
+    payload_enriched_collection = mydb['payload_enriched_batch']
+    db_payload = payload_enriched_collection.find({})
+
+    print(db_payload)
 
     db = create_engine(postgres_connection)
     conn = db.connect()
 
-    df = pd.DataFrame([db_payload])
-    df['job_id'] = str(db_payload_id)
-    df = df[['job_id', 'disclaimer', 'chart_name', 'bpi_usd_code', 'bpi_usd_rate_float', 'bpi_usd_description', 'bpi_gdp_code', 'bpi_gdp_rate_float', 'bpi_gdp_description', 'bpi_eur_code', 'bpi_eur_rate_float', 'bpi_eur_description', "bpi_idr_rate_float", 'time_updated', 'time_updated_iso', 'last_updated']]
-    df.to_sql('data', con=conn, index=False,if_exists="append")
+    df = pd.DataFrame.from_records(db_payload)
+    df['_id'] = df['_id'].apply(lambda id: str(id))
+    print(df.columns)
+
+    df = df[['_id','disclaimer', 'chart_name', 'bpi_usd_code', 'bpi_usd_rate_float', 'bpi_usd_description', 'bpi_gdp_code', 'bpi_gdp_rate_float', 'bpi_gdp_description', 'bpi_eur_code', 'bpi_eur_rate_float', 'bpi_eur_description', "bpi_idr_rate_float", 'time_updated', 'time_updated_iso', 'last_updated']]
+    print(df.head(5))
+    df.to_sql('data_batched', con=conn, index=False,if_exists="append")
+
+@provide_session
+def cleanup(session=None, **context):
+    dag = context["dag"]
+    dag_id = dag._dag_id
+
+    # It will delete all xcom of the dag_id
+    session.query(XCom).filter(XCom.dag_id == dag_id).delete()
+
+def cleandb(ti):
+    # Load to staging-db
+    payload_enriched_collection = mydb['payload_enriched_batch']
+    payload_enriched_collection.drop()
 
 
 
 
-with DAG(dag_id="bpi_crawler_advanced", start_date=datetime(2021,1,1), 
-    schedule_interval="@hourly", catchup=False) as dag:
+with DAG(dag_id="bpi_dump_crawler_advanced", start_date=datetime(2021,1,1), 
+    schedule_interval="*/10 * * * *", catchup=False) as dag:
 
     crawl = PythonOperator(
         task_id="retrieve_bpi_value",
@@ -194,6 +196,13 @@ with DAG(dag_id="bpi_crawler_advanced", start_date=datetime(2021,1,1),
     quality_checking = PythonOperator(
         task_id="Validation",
         python_callable=test)
+
+    crawl >> retrieve_idr_value >> enrichment >> quality_checking  
+
+
+
+with DAG(dag_id="bpi_batch_store_crawler_advanced", start_date=datetime(2021,1,1), 
+    schedule_interval="@hourly", catchup=False) as dag:
     
     load_data = PythonOperator(
         task_id="Load",
@@ -210,7 +219,4 @@ with DAG(dag_id="bpi_crawler_advanced", start_date=datetime(2021,1,1),
         # dag=dag
     )
 
-
-    crawl >> retrieve_idr_value >> enrichment >> quality_checking >> load_data >> clean_db >> clean_xcom  
-
-
+    load_data >> clean_db >> clean_xcom  
